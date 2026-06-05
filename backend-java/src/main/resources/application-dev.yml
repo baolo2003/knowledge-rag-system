@@ -1,0 +1,21 @@
+# Development environment configuration
+logging:
+  level:
+    root: INFO
+    com.example.rag: DEBUG
+    org.springframework.security: DEBUG
+
+spring:
+  # Dev-specific datasource (overrides are via env vars)
+  datasource:
+    hikari:
+      maximum-pool-size: 10
+
+  # Dev-specific Redis
+  data:
+    redis:
+      database: 0
+
+# Knife4j always enabled in dev
+knife4j:
+  enable: true

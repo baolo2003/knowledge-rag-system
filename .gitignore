@@ -1,0 +1,73 @@
+# ===========================
+# OS Files
+# ===========================
+.DS_Store
+Thumbs.db
+
+# ===========================
+# IDE
+# ===========================
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+
+# ===========================
+# Java
+# ===========================
+target/
+*.class
+*.jar
+*.war
+!gradle/wrapper/gradle-wrapper.jar
+
+# ===========================
+# Node.js (Vue Frontend)
+# ===========================
+node_modules/
+dist/
+.env.local
+.env.*.local
+*.log
+npm-debug.log*
+
+# ===========================
+# Python
+# ===========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+eggs/
+.eggs/
+venv/
+.venv/
+*.egg
+
+# ===========================
+# Environment / Secrets
+# ===========================
+.env
+.env.*
+
+# ===========================
+# Data
+# ===========================
+chroma_data/
+*.db
+uploads/
+
+# ===========================
+# Docker
+# ===========================
+docker-compose.override.yml
+
+# ===========================
+# Misc
+# ===========================
+*.tmp
+*.bak

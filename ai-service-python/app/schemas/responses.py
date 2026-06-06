@@ -42,8 +42,9 @@ class ParseResult(BaseModel):
         {
           "doc_id": 42,
           "status": "SUCCESS",
-          "chunk_count": 25,
-          "message": "文档解析完成",
+          "chunk_count": 0,
+          "message": "文档解析完成 | 类型: PDF | 字符数: 15240",
+          "text": "第一章 概述\\n1.1 项目背景...",
           "error": null
         }
     """
@@ -57,17 +58,22 @@ class ParseResult(BaseModel):
     chunk_count: int = Field(
         default=0,
         ge=0,
-        description="生成的切片数量",
+        description="生成的切片数量（含解析→切分→向量化→写入 Chroma 全流程）",
         examples=[25],
     )
     message: str = Field(
         default="",
-        description="状态描述信息",
-        examples=["文档解析完成"],
+        description="状态描述信息（含统计摘要）",
+        examples=["文档解析完成 | 类型: PDF | 字符数: 15240 | 行数: 320 | 耗时: 42ms"],
+    )
+    text: str = Field(
+        default="",
+        description="提取的原始文本内容（后续章节会基于此进行切片和向量化）",
+        examples=["第一章 概述\n1.1 项目背景\n..."],
     )
     error: Optional[str] = Field(
         default=None,
-        description="失败时的错误详情",
+        description="失败时的错误详情（SUCCESS 时为 null）",
         examples=[None],
     )
 

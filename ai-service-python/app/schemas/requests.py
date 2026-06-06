@@ -28,7 +28,11 @@ class ParseRequest(BaseModel):
           "doc_id": 42,
           "minio_path": "1/pdf/a1b2c3d4.pdf",
           "file_type": "pdf",
-          "kb_id": 1
+          "kb_id": 1,
+          "file_name": "产品手册_v2.0.pdf",
+          "owner_id": 10,
+          "visibility": "ORG",
+          "org_id": 5
         }
     """
 
@@ -57,6 +61,30 @@ class ParseRequest(BaseModel):
         description="所属知识库 ID",
         examples=[1],
     )
+    file_name: str = Field(
+        default="",
+        max_length=500,
+        description="原始文件名（用于元数据存储）",
+        examples=["产品手册_v2.0.pdf"],
+    )
+    owner_id: int = Field(
+        default=0,
+        ge=0,
+        description="上传用户 ID（用于权限元数据）",
+        examples=[10],
+    )
+    visibility: str = Field(
+        default="PRIVATE",
+        pattern=r"^(PRIVATE|PUBLIC|ORG)$",
+        description="可见范围：PRIVATE / PUBLIC / ORG",
+        examples=["ORG"],
+    )
+    org_id: int = Field(
+        default=0,
+        ge=0,
+        description="组织 ID（ORG 可见时必填，其他情况为 0）",
+        examples=[5],
+    )
 
 
 # ============================================================
@@ -65,7 +93,7 @@ class ParseRequest(BaseModel):
 
 class SearchRequest(BaseModel):
     """
-    Semantic / hybrid search request.
+    Semantic / hybrid search request with permission context.
 
     Example::
 
@@ -74,7 +102,10 @@ class SearchRequest(BaseModel):
           "kb_id": 1,
           "top_k": 5,
           "similarity_threshold": 0.35,
-          "hybrid_alpha": 0.5
+          "hybrid_alpha": 0.5,
+          "user_id": 10,
+          "role": "USER",
+          "org_id": 5
         }
     """
 
@@ -102,7 +133,7 @@ class SearchRequest(BaseModel):
         default=0.35,
         ge=0.0,
         le=1.0,
-        description="相似度阈值（低于此值的结果被丢弃）",
+        description="RRF 融合分数阈值（低于此值的结果被丢弃）",
         examples=[0.35],
     )
     hybrid_alpha: float = Field(
@@ -114,6 +145,24 @@ class SearchRequest(BaseModel):
             "0.5 = 向量 + BM25 均等混合，1 = 纯向量语义检索"
         ),
         examples=[0.5],
+    )
+    user_id: int = Field(
+        default=0,
+        ge=0,
+        description="当前用户 ID（0 = 匿名用户，仅可查看 PUBLIC 内容）",
+        examples=[10],
+    )
+    role: str = Field(
+        default="USER",
+        pattern=r"^(USER|ADMIN)$",
+        description="用户角色：USER / ADMIN（ADMIN 绕过权限过滤）",
+        examples=["USER"],
+    )
+    org_id: int = Field(
+        default=0,
+        ge=0,
+        description="用户所属组织 ID（0 = 无组织）",
+        examples=[5],
     )
 
 
@@ -185,11 +234,29 @@ class ChatRequest(BaseModel):
         examples=[5],
     )
     temperature: float = Field(
-        default=0.7,
+        default=0.3,
         ge=0.0,
         le=2.0,
-        description="LLM 生成温度",
-        examples=[0.7],
+        description="LLM 生成温度（知识问答推荐 0.3）",
+        examples=[0.3],
+    )
+    user_id: int = Field(
+        default=0,
+        ge=0,
+        description="当前用户 ID（用于权限过滤检索）",
+        examples=[10],
+    )
+    role: str = Field(
+        default="USER",
+        pattern=r"^(USER|ADMIN)$",
+        description="用户角色",
+        examples=["USER"],
+    )
+    org_id: int = Field(
+        default=0,
+        ge=0,
+        description="用户所属组织 ID",
+        examples=[5],
     )
 
 

@@ -1,12 +1,17 @@
 package com.example.rag.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.metadata.IPage;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.example.rag.common.BusinessException;
 import com.example.rag.common.FileUploadValidator;
 import com.example.rag.common.SecurityUtils;
 import com.example.rag.dto.response.DocumentResponse;
+import com.example.rag.dto.response.PageResponse;
 import com.example.rag.entity.Document;
+import com.example.rag.entity.DocumentChunk;
 import com.example.rag.entity.KnowledgeBase;
+import com.example.rag.mapper.DocumentChunkMapper;
 import com.example.rag.mapper.DocumentMapper;
 import com.example.rag.mapper.KnowledgeBaseMapper;
 import com.example.rag.service.DocumentParseService;
@@ -14,36 +19,50 @@ import com.example.rag.service.DocumentService;
 import com.example.rag.service.MinioService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StringUtils;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
-import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.time.LocalDateTime;
+import java.util.HashMap;
 import java.util.HexFormat;
-import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 文档服务实现
  *
- * <h3>上传流程</h3>
+ * <h3>上传流程（7 步）</h3>
  * <ol>
  *   <li>文件安全校验（Magic Number + 扩展名 + 大小）</li>
- *   <li>知识库权限校验（用户必须有 KB 访问权限）</li>
+ *   <li>知识库权限校验</li>
  *   <li>MD5 去重（同一 KB 下相同 MD5 跳过上传）</li>
  *   <li>上传到 MinIO</li>
  *   <li>保存元数据到 MySQL（parse_status = PENDING）</li>
+ *   <li>写入 Redis 缓存</li>
  *   <li>异步触发 Python 解析</li>
  * </ol>
  *
- * <h3>parse_status 状态机</h3>
+ * <h3>删除流程（4 步）</h3>
+ * <ol>
+ *   <li>权限校验（owner 或 admin）</li>
+ *   <li>软删除 MySQL 记录</li>
+ *   <li>Redis 缓存失效</li>
+ *   <li>异步清理 MinIO + 切片数据 + 向量库</li>
+ * </ol>
+ *
+ * <h3>Redis 缓存 Key 设计</h3>
  * <pre>
- * PENDING  → PARSING → SUCCESS
- *                    → FAILED (记录 parse_fail_msg)
+ * doc:{docId}              — 文档详情缓存（Hash）
+ * kb:{kbId}:docs:page:*    — 文档列表分页缓存（通配失效）
+ * kb:{kbId}:doc:count      — 文档计数缓存
  * </pre>
  *
  * @author knowledge-rag-team
@@ -54,15 +73,26 @@ import java.util.List;
 public class DocumentServiceImpl implements DocumentService {
 
     private final DocumentMapper documentMapper;
+    private final DocumentChunkMapper documentChunkMapper;
     private final KnowledgeBaseMapper knowledgeBaseMapper;
     private final MinioService minioService;
     private final FileUploadValidator fileUploadValidator;
     private final DocumentParseService documentParseService;
+    private final StringRedisTemplate redisTemplate;
 
-    // ==================== 可见范围常量 ====================
+    // ==================== 常量 ====================
+
     private static final String VISIBILITY_PRIVATE = "PRIVATE";
     private static final String VISIBILITY_PUBLIC = "PUBLIC";
     private static final String VISIBILITY_ORG = "ORG";
+
+    private static final String CACHE_DOC_PREFIX = "doc:";
+    private static final String CACHE_KB_DOCS_PREFIX = "kb:";
+    private static final String CACHE_DOC_COUNT_SUFFIX = ":doc:count";
+    private static final String CACHE_DOCS_PAGE_SUFFIX = ":docs:page:";
+
+    /** 文档详情缓存过期时间（小时） */
+    private static final int CACHE_DOC_TTL_HOURS = 24;
 
     // ==================== 上传文档 ====================
 
@@ -81,8 +111,7 @@ public class DocumentServiceImpl implements DocumentService {
         checkKbUploadPermission(kb);
 
         // ===== 3. 确定文档可见范围 =====
-        // 默认继承知识库的可见性
-        String docVisibility = (visibility != null && !visibility.isBlank())
+        String docVisibility = StringUtils.hasText(visibility)
                 ? visibility.toUpperCase() : kb.getVisibility();
         Long docOrgId = VISIBILITY_ORG.equals(docVisibility)
                 ? (orgId != null ? orgId : kb.getOrgId()) : null;
@@ -102,8 +131,7 @@ public class DocumentServiceImpl implements DocumentService {
         if (existingDoc != null) {
             log.info("MD5 去重命中: kbId={}, md5={}, existingDocId={}, fileName={}",
                     kbId, md5Hex, existingDoc.getId(), existingDoc.getFileName());
-            return DocumentResponse.from(existingDoc,
-                    minioService.getPresignedUrl(existingDoc.getMinioPath()));
+            return buildResponse(existingDoc);
         }
 
         // ===== 5. 上传到 MinIO =====
@@ -139,71 +167,100 @@ public class DocumentServiceImpl implements DocumentService {
         log.info("文档元数据已保存: docId={}, fileName={}, kbId={}, md5={}, size={}",
                 doc.getId(), safeFilename, kbId, md5Hex, fileSize);
 
-        // ===== 7. 异步触发 Python 解析 =====
+        // ===== 7. 写入 Redis 缓存 =====
+        cacheDocument(doc);
+
+        // ===== 8. 使知识库文档列表缓存失效 =====
+        evictKbDocListCache(kbId);
+
+        // ===== 9. 异步触发 Python 解析 =====
         documentParseService.triggerParseAsync(doc.getId());
 
-        return DocumentResponse.from(doc);
+        return buildResponse(doc);
     }
 
-    // ==================== 列出知识库下的文档 ====================
+    // ==================== 分页列出知识库下的文档 ====================
 
     @Override
-    public List<DocumentResponse> listByKb(Long kbId) {
-        // 校验知识库存在 + 查看权限
+    public PageResponse<DocumentResponse> listByKb(Long kbId, int page, int size, String keyword) {
+        // 1. 校验知识库存在 + 查看权限
         KnowledgeBase kb = knowledgeBaseMapper.selectById(kbId);
         if (kb == null) {
             throw new BusinessException(404, "知识库不存在");
         }
         checkKbViewPermission(kb);
 
-        // 权限过滤查询
+        // 2. 构建权限过滤 + 搜索条件
         LambdaQueryWrapper<Document> wrapper = buildPermissionFilter(kbId);
+
+        // 文件名模糊搜索
+        if (StringUtils.hasText(keyword)) {
+            wrapper.like(Document::getFileName, keyword);
+        }
+
         wrapper.orderByDesc(Document::getCreateTime);
 
-        List<Document> docs = documentMapper.selectList(wrapper);
-        log.debug("文档列表查询: kbId={}, userId={}, 结果数={}",
-                kbId, SecurityUtils.getCurrentUserId(), docs.size());
+        // 3. MyBatis-Plus 分页查询
+        Page<Document> pageObj = new Page<>(page, size);
+        IPage<Document> result = documentMapper.selectPage(pageObj, wrapper);
 
-        // 附带预签名下载 URL
-        return docs.stream()
-                .map(doc -> DocumentResponse.from(doc,
-                        minioService.getPresignedUrl(doc.getMinioPath())))
-                .toList();
+        log.debug("文档分页查询: kbId={}, page={}, size={}, keyword={}, total={}",
+                kbId, page, size, keyword, result.getTotal());
+
+        // 4. 转换结果（含预签名 URL）
+        return PageResponse.from(result, doc -> buildResponse(doc));
     }
 
     // ==================== 获取文档详情 ====================
 
     @Override
     public DocumentResponse getById(Long docId) {
-        Document doc = documentMapper.selectById(docId);
+        // 1. 尝试从 Redis 读取
+        Document doc = getCachedDocument(docId);
+        if (doc != null) {
+            log.debug("文档缓存命中: docId={}", docId);
+            checkDocViewPermission(doc);
+            return buildResponse(doc);
+        }
+
+        // 2. 从 MySQL 查询
+        doc = documentMapper.selectById(docId);
         if (doc == null) {
             throw new BusinessException(404, "文档不存在");
         }
 
+        // 3. 权限校验
         checkDocViewPermission(doc);
 
-        return DocumentResponse.from(doc,
-                minioService.getPresignedUrl(doc.getMinioPath()));
+        // 4. 写入缓存
+        cacheDocument(doc);
+
+        return buildResponse(doc);
     }
 
-    // ==================== 删除文档（软删除 + 异步清理） ====================
+    // ==================== 删除文档（完整实现） ====================
 
     @Override
     @Transactional
     public void delete(Long docId) {
+        // ===== 1. 查询文档 =====
         Document doc = documentMapper.selectById(docId);
         if (doc == null) {
             throw new BusinessException(404, "文档不存在");
         }
 
-        // 仅 owner 或 admin 可删除
+        // ===== 2. 权限校验（仅 owner 或 admin 可删除） =====
         checkOwnerOrAdmin(doc, "删除");
 
-        // MyBatis-Plus @TableLogic 自动转为软删除
+        // ===== 3. 软删除（MyBatis-Plus @TableLogic） =====
         documentMapper.deleteById(docId);
-        log.info("文档已软删除: docId={}, fileName={}", doc.getId(), doc.getFileName());
+        log.info("文档已软删除: docId={}, fileName={}, kbId={}", docId, doc.getFileName(), doc.getKbId());
 
-        // 异步清理 MinIO 文件和切片数据
+        // ===== 4. Redis 缓存失效 =====
+        evictDocumentCache(docId);
+        evictKbDocListCache(doc.getKbId());
+
+        // ===== 5. 异步清理 MinIO + 切片 + 向量库 =====
         asyncCleanup(doc);
     }
 
@@ -212,38 +269,52 @@ public class DocumentServiceImpl implements DocumentService {
     @Override
     @Transactional
     public DocumentResponse reparse(Long docId) {
+        // ===== 1. 查询文档 =====
         Document doc = documentMapper.selectById(docId);
         if (doc == null) {
             throw new BusinessException(404, "文档不存在");
         }
 
-        // 权限校验
+        // ===== 2. 权限校验 =====
         checkDocViewPermission(doc);
 
-        // 仅 PENDING / FAILED 状态可重新解析
+        // ===== 3. 状态机校验：仅 PENDING / FAILED / SUCCESS 可重新解析 =====
         if ("PARSING".equals(doc.getParseStatus())) {
-            throw new BusinessException(400, "文档正在解析中，请稍后再试");
+            throw new BusinessException(400, "文档正在解析中，请稍等片刻再试");
         }
 
-        // 重置状态
+        // ===== 4. 清理旧切片数据（如果有） =====
+        if (doc.getChunkCount() != null && doc.getChunkCount() > 0) {
+            // 先清理向量库中的旧向量
+            documentParseService.deleteVectorsAsync(doc.getId(), doc.getKbId());
+            // 删除旧的切片记录
+            documentChunkMapper.delete(
+                    new LambdaQueryWrapper<DocumentChunk>()
+                            .eq(DocumentChunk::getDocumentId, docId)
+            );
+            log.info("旧切片数据已清理: docId={}, oldChunkCount={}", docId, doc.getChunkCount());
+        }
+
+        // ===== 5. 重置解析状态 =====
         doc.setParseStatus("PENDING");
         doc.setParseFailMsg(null);
         doc.setChunkCount(0);
         doc.setUpdateTime(LocalDateTime.now());
         documentMapper.updateById(doc);
-        log.info("文档重新解析已触发: docId={}, fileName={}", doc.getId(), doc.getFileName());
+        log.info("文档解析状态已重置: docId={}, fileName={}", docId, doc.getFileName());
 
-        // 异步触发解析
+        // ===== 6. 更新 Redis 缓存 =====
+        cacheDocument(doc);
+        evictKbDocListCache(doc.getKbId());
+
+        // ===== 7. 异步触发 Python 解析 =====
         documentParseService.triggerParseAsync(doc.getId());
 
-        return DocumentResponse.from(doc);
+        return buildResponse(doc);
     }
 
-    // ==================== 私有辅助方法 ====================
+    // ==================== 私有：MD5 / 去重 ====================
 
-    /**
-     * 计算文件 MD5
-     */
     private String computeMd5(byte[] fileBytes) {
         try {
             MessageDigest md = MessageDigest.getInstance("MD5");
@@ -254,9 +325,6 @@ public class DocumentServiceImpl implements DocumentService {
         }
     }
 
-    /**
-     * 在同一 KB 下查找 MD5 重复且未删除的文档
-     */
     private Document findDuplicateInKb(Long kbId, String md5) {
         return documentMapper.selectOne(
                 new LambdaQueryWrapper<Document>()
@@ -266,10 +334,12 @@ public class DocumentServiceImpl implements DocumentService {
         );
     }
 
+    // ==================== 私有：权限过滤查询构建 ====================
+
     /**
-     * 构建权限过滤查询条件
+     * 构建权限过滤 + kb_id 查询条件
      *
-     * <p>当前用户可见的文档：
+     * <p>普通用户可见：
      * <pre>
      *   kb_id = ? AND (
      *     owner_id = 自己
@@ -277,13 +347,12 @@ public class DocumentServiceImpl implements DocumentService {
      *     OR (visibility = 'ORG' AND org_id = 自己的 org_id)
      *   )
      * </pre>
-     * ADMIN 仅按 kb_id 过滤，不受文档级权限限制。
+     * ADMIN 仅按 kb_id 过滤。
      */
     private LambdaQueryWrapper<Document> buildPermissionFilter(Long kbId) {
         LambdaQueryWrapper<Document> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(Document::getKbId, kbId);
 
-        // ADMIN 不受文档级权限限制
         if (SecurityUtils.isAdmin()) {
             return wrapper;
         }
@@ -305,72 +374,49 @@ public class DocumentServiceImpl implements DocumentService {
         return wrapper;
     }
 
-    // ==================== 权限校验方法 ====================
+    // ==================== 私有：权限校验 ====================
 
-    /**
-     * 校验知识库上传权限（用户必须对 KB 有可见权限才能上传）
-     */
     private void checkKbUploadPermission(KnowledgeBase kb) {
-        if (SecurityUtils.isAdmin()) {
-            return;
-        }
+        if (SecurityUtils.isAdmin()) return;
         Long currentUserId = SecurityUtils.getCurrentUserId();
         Long currentOrgId = SecurityUtils.getCurrentUserOrgId();
 
         if (kb.getOwnerId().equals(currentUserId)) return;
         if (VISIBILITY_PUBLIC.equals(kb.getVisibility())) return;
         if (VISIBILITY_ORG.equals(kb.getVisibility())
-                && kb.getOrgId() != null
-                && kb.getOrgId().equals(currentOrgId)) return;
+                && kb.getOrgId() != null && kb.getOrgId().equals(currentOrgId)) return;
 
         throw new BusinessException(403, "无权向该知识库上传文档");
     }
 
-    /**
-     * 校验知识库查看权限
-     */
     private void checkKbViewPermission(KnowledgeBase kb) {
-        if (SecurityUtils.isAdmin()) {
-            return;
-        }
+        if (SecurityUtils.isAdmin()) return;
         Long currentUserId = SecurityUtils.getCurrentUserId();
         Long currentOrgId = SecurityUtils.getCurrentUserOrgId();
 
         if (kb.getOwnerId().equals(currentUserId)) return;
         if (VISIBILITY_PUBLIC.equals(kb.getVisibility())) return;
         if (VISIBILITY_ORG.equals(kb.getVisibility())
-                && kb.getOrgId() != null
-                && kb.getOrgId().equals(currentOrgId)) return;
+                && kb.getOrgId() != null && kb.getOrgId().equals(currentOrgId)) return;
 
         throw new BusinessException(403, "无权查看该知识库下的文档");
     }
 
-    /**
-     * 校验文档查看权限
-     */
     private void checkDocViewPermission(Document doc) {
-        if (SecurityUtils.isAdmin()) {
-            return;
-        }
+        if (SecurityUtils.isAdmin()) return;
         Long currentUserId = SecurityUtils.getCurrentUserId();
         Long currentOrgId = SecurityUtils.getCurrentUserOrgId();
 
         if (doc.getOwnerId().equals(currentUserId)) return;
         if (VISIBILITY_PUBLIC.equals(doc.getVisibility())) return;
         if (VISIBILITY_ORG.equals(doc.getVisibility())
-                && doc.getOrgId() != null
-                && doc.getOrgId().equals(currentOrgId)) return;
+                && doc.getOrgId() != null && doc.getOrgId().equals(currentOrgId)) return;
 
         throw new BusinessException(403, "无权查看该文档");
     }
 
-    /**
-     * 校验 owner 或 admin
-     */
     private void checkOwnerOrAdmin(Document doc, String action) {
-        if (SecurityUtils.isAdmin()) {
-            return;
-        }
+        if (SecurityUtils.isAdmin()) return;
         Long currentUserId = SecurityUtils.getCurrentUserId();
         if (!doc.getOwnerId().equals(currentUserId)) {
             throw new BusinessException(403,
@@ -378,9 +424,6 @@ public class DocumentServiceImpl implements DocumentService {
         }
     }
 
-    /**
-     * 校验文档可见范围
-     */
     private void validateDocVisibility(String visibility, Long orgId) {
         if (!VISIBILITY_PRIVATE.equals(visibility)
                 && !VISIBILITY_PUBLIC.equals(visibility)
@@ -393,35 +436,162 @@ public class DocumentServiceImpl implements DocumentService {
         }
     }
 
-    // ==================== 异步清理 ====================
+    // ==================== 私有：Redis 缓存操作 ====================
 
     /**
-     * 异步清理 MinIO 文件和切片数据
+     * 缓存文档详情
+     */
+    private void cacheDocument(Document doc) {
+        try {
+            String key = CACHE_DOC_PREFIX + doc.getId();
+            Map<String, String> fields = new HashMap<>();
+            fields.put("id", String.valueOf(doc.getId()));
+            fields.put("kbId", String.valueOf(doc.getKbId()));
+            fields.put("fileName", doc.getFileName() != null ? doc.getFileName() : "");
+            fields.put("fileType", doc.getFileType() != null ? doc.getFileType() : "");
+            fields.put("fileSize", String.valueOf(doc.getFileSize()));
+            fields.put("parseStatus", doc.getParseStatus() != null ? doc.getParseStatus() : "PENDING");
+            fields.put("chunkCount", String.valueOf(doc.getChunkCount() != null ? doc.getChunkCount() : 0));
+            fields.put("minioPath", doc.getMinioPath() != null ? doc.getMinioPath() : "");
+            fields.put("ownerId", String.valueOf(doc.getOwnerId()));
+            fields.put("visibility", doc.getVisibility() != null ? doc.getVisibility() : "");
+            fields.put("orgId", String.valueOf(doc.getOrgId() != null ? doc.getOrgId() : ""));
+            fields.put("createTime", doc.getCreateTime() != null ? doc.getCreateTime().toString() : "");
+            redisTemplate.opsForHash().putAll(key, fields);
+            redisTemplate.expire(key, CACHE_DOC_TTL_HOURS, TimeUnit.HOURS);
+        } catch (Exception e) {
+            log.warn("文档缓存写入失败: docId={}", doc.getId(), e);
+        }
+    }
+
+    /**
+     * 从缓存获取文档
+     */
+    private Document getCachedDocument(Long docId) {
+        try {
+            String key = CACHE_DOC_PREFIX + docId;
+            Object fileName = redisTemplate.opsForHash().get(key, "fileName");
+            if (fileName == null) return null;
+
+            Document doc = new Document();
+            doc.setId(docId);
+            doc.setKbId(parseLong(redisTemplate.opsForHash().get(key, "kbId")));
+            doc.setFileName(String.valueOf(fileName));
+            doc.setFileType(String.valueOf(redisTemplate.opsForHash().get(key, "fileType")));
+            doc.setFileSize(parseLong(redisTemplate.opsForHash().get(key, "fileSize")));
+            doc.setParseStatus(String.valueOf(redisTemplate.opsForHash().get(key, "parseStatus")));
+            doc.setChunkCount(parseInt(redisTemplate.opsForHash().get(key, "chunkCount")));
+            doc.setMinioPath(String.valueOf(redisTemplate.opsForHash().get(key, "minioPath")));
+            doc.setOwnerId(parseLong(redisTemplate.opsForHash().get(key, "ownerId")));
+            doc.setVisibility(String.valueOf(redisTemplate.opsForHash().get(key, "visibility")));
+            doc.setOrgId(parseLong(redisTemplate.opsForHash().get(key, "orgId")));
+
+            String createTime = String.valueOf(redisTemplate.opsForHash().get(key, "createTime"));
+            if (!"null".equals(createTime) && !createTime.isEmpty()) {
+                doc.setCreateTime(LocalDateTime.parse(createTime));
+            }
+            return doc;
+        } catch (Exception e) {
+            log.warn("文档缓存读取失败: docId={}", docId, e);
+            return null;
+        }
+    }
+
+    /**
+     * 使单个文档缓存失效
+     */
+    private void evictDocumentCache(Long docId) {
+        try {
+            String key = CACHE_DOC_PREFIX + docId;
+            Boolean deleted = redisTemplate.delete(key);
+            log.debug("文档缓存已失效: docId={}, deleted={}", docId, deleted);
+        } catch (Exception e) {
+            log.warn("文档缓存失效失败: docId={}", docId, e);
+        }
+    }
+
+    /**
+     * 使知识库文档列表相关缓存全部失效（通配删除）
+     */
+    private void evictKbDocListCache(Long kbId) {
+        try {
+            // 删除文档计数缓存
+            String countKey = CACHE_KB_DOCS_PREFIX + kbId + CACHE_DOC_COUNT_SUFFIX;
+            redisTemplate.delete(countKey);
+
+            // 通配删除分页缓存
+            String pattern = CACHE_KB_DOCS_PREFIX + kbId + CACHE_DOCS_PAGE_SUFFIX + "*";
+            Set<String> keys = redisTemplate.keys(pattern);
+            if (keys != null && !keys.isEmpty()) {
+                redisTemplate.delete(keys);
+                log.debug("文档列表缓存已失效: kbId={}, keys={}", kbId, keys.size());
+            }
+        } catch (Exception e) {
+            log.warn("文档列表缓存失效失败: kbId={}", kbId, e);
+        }
+    }
+
+    private Long parseLong(Object obj) {
+        if (obj == null) return null;
+        try { return Long.parseLong(String.valueOf(obj)); } catch (NumberFormatException e) { return null; }
+    }
+
+    private Integer parseInt(Object obj) {
+        if (obj == null) return 0;
+        try { return Integer.parseInt(String.valueOf(obj)); } catch (NumberFormatException e) { return 0; }
+    }
+
+    // ==================== 私有：异步清理 ====================
+
+    /**
+     * 异步清理：MinIO 文件 + 切片数据 + 向量库
      *
-     * <p>软删除后异步执行，不阻塞主流程，失败不影响删除操作</p>
+     * <p>软删除后异步执行，不阻塞主流程，失败不影响删除状态</p>
      */
     @Async
     public void asyncCleanup(Document doc) {
-        log.info("开始异步清理文档资源: docId={}, minioPath={}", doc.getId(), doc.getMinioPath());
+        log.info("开始异步清理文档资源: docId={}, fileName={}, minioPath={}",
+                doc.getId(), doc.getFileName(), doc.getMinioPath());
 
-        // 1. 删除 MinIO 文件
+        // ---- 1. 清理 MinIO 文件 ----
         try {
             boolean deleted = minioService.delete(doc.getMinioPath());
             if (deleted) {
                 log.info("MinIO 文件已清理: docId={}, path={}", doc.getId(), doc.getMinioPath());
+            } else {
+                log.warn("MinIO 文件不存在或已清理: docId={}, path={}", doc.getId(), doc.getMinioPath());
             }
         } catch (Exception e) {
-            log.error("MinIO 文件清理失败: docId={}, path={}",
-                    doc.getId(), doc.getMinioPath(), e);
+            log.error("MinIO 文件清理失败: docId={}, path={}", doc.getId(), doc.getMinioPath(), e);
         }
 
-        // 2. 删除关联的切片数据（document_chunk 表）
+        // ---- 2. 清理切片数据（document_chunk 表） ----
         try {
-            // 使用 Mapper 直接删除切片（后面会用 DocumentChunkMapper）
-            // documentChunkMapper 暂未注入，通过 knowledgeBaseMapper 的 SqlSession 操作
-            log.info("切片数据清理完成: docId={}", doc.getId());
+            int deletedChunks = documentChunkMapper.delete(
+                    new LambdaQueryWrapper<DocumentChunk>()
+                            .eq(DocumentChunk::getDocumentId, doc.getId())
+            );
+            log.info("切片数据已清理: docId={}, deletedChunks={}", doc.getId(), deletedChunks);
         } catch (Exception e) {
             log.error("切片数据清理失败: docId={}", doc.getId(), e);
         }
+
+        // ---- 3. 清理向量库 ----
+        try {
+            documentParseService.deleteVectorsAsync(doc.getId(), doc.getKbId());
+        } catch (Exception e) {
+            log.error("向量库清理失败: docId={}", doc.getId(), e);
+        }
+
+        log.info("异步清理完成: docId={}", doc.getId());
+    }
+
+    // ==================== 私有：构建响应 ====================
+
+    /**
+     * 构建 DocumentResponse（含预签名下载 URL）
+     */
+    private DocumentResponse buildResponse(Document doc) {
+        return DocumentResponse.from(doc, minioService.getPresignedUrl(doc.getMinioPath()));
     }
 }
